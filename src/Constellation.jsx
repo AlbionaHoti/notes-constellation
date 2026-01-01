@@ -92,13 +92,13 @@ function AnimatedConnection({ from, to, fromColor, toColor, strength, reason, is
         ref={lineRef}
         points={points}
         color={lineColor}
-        lineWidth={isHovered ? 3 : 1.5}
-        opacity={isHovered ? 0.9 : strength * 0.4}
+        lineWidth={isHovered ? 8 : 4} // THICK like highlighter
+        opacity={isHovered ? 0.95 : strength * 0.6} // More visible
         transparent
-        dashed={fromColor !== toColor} // Dashed if cross-cluster
+        dashed={fromColor !== toColor}
         dashScale={50}
-        dashSize={0.1}
-        gapSize={0.05}
+        dashSize={0.15}
+        gapSize={0.08}
       />
     </group>
   )

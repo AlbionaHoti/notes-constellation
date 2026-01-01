@@ -24,94 +24,109 @@ async function fetchNotes() {
     const countResult = execSync(`osascript -e '${countScript}'`, { encoding: 'utf-8' });
     const totalNotes = parseInt(countResult.trim());
 
-    console.log(`📊 Found ${totalNotes} total notes, fetching all...\n`);
+    console.log(`📊 Found ${totalNotes} total notes, fetching all in batches...\n`);
 
     const notes = [];
-    const limit = totalNotes; // Get ALL notes
+    const batchSize = 10; // Process 10 notes at a time
+    const limit = totalNotes;
 
-    for (let i = 1; i <= limit; i++) {
-      try {
-        const noteScript = `
-          tell application "Notes"
-            set theNote to note ${i}
-            set noteText to body of theNote as text
-            set noteDate to modification date of theNote as text
-            set noteAttachments to count of attachments of theNote
-            return noteText & "|||DIVIDER|||" & noteDate & "|||DIVIDER|||" & noteAttachments
-          end tell
-        `;
+    // Batch processing for speed
+    for (let batch = 0; batch < Math.ceil(limit / batchSize); batch++) {
+      const start = batch * batchSize + 1;
+      const end = Math.min((batch + 1) * batchSize, limit);
 
-        const result = execSync(`osascript -e '${noteScript.replace(/'/g, "'\"'\"'")}'`, {
-          encoding: 'utf-8',
-          maxBuffer: 1024 * 1024,
-          timeout: 5000
-        }).trim();
+      console.log(`  📦 Batch ${batch + 1}/${Math.ceil(limit / batchSize)}: Notes ${start}-${end}`);
 
-        const parts = result.split('|||DIVIDER|||');
-        const [content, dateStr, attachmentCount] = parts;
+      // Process batch in parallel
+      const batchPromises = [];
+      for (let i = start; i <= end; i++) {
+        batchPromises.push(
+          new Promise((resolve) => {
+            try {
+              const noteScript = `
+                tell application "Notes"
+                  set theNote to note ${i}
+                  set noteText to body of theNote as text
+                  set noteDate to modification date of theNote as text
+                  set noteAttachments to count of attachments of theNote
+                  return noteText & "|||DIVIDER|||" & noteDate & "|||DIVIDER|||" & noteAttachments
+                end tell
+              `;
 
-        if (!content || content.trim().length === 0) {
-          continue;
-        }
+              const result = execSync(`osascript -e '${noteScript.replace(/'/g, "'\"'\"'")}'`, {
+                encoding: 'utf-8',
+                maxBuffer: 2 * 1024 * 1024, // 2MB buffer
+                timeout: 10000 // 10 second timeout per note
+              }).trim();
 
-        // Extract URLs before cleaning HTML
-        const urlRegex = /(https?:\/\/[^\s<>"]+)/g;
-        const urls = content.match(urlRegex) || [];
+              const parts = result.split('|||DIVIDER|||');
+              const [content, dateStr, attachmentCount] = parts;
 
-        // Clean HTML but preserve structure
-        const cleanContent = content
-          .substring(0, 10000) // Limit to prevent buffer overflow
-          .replace(/<br>/g, '\n')  // Convert <br> to newlines
-          .replace(/<[^>]*>/g, ' ')  // Replace other HTML tags with space
-          .replace(/&amp;/g, '&')
-          .replace(/&lt;/g, '<')
-          .replace(/&gt;/g, '>')
-          .replace(/&quot;/g, '"')
-          .replace(/\s+/g, ' ')  // Collapse multiple spaces
-          .replace(/\n\s+/g, '\n')  // Clean up newlines
-          .trim();
+              if (!content || content.trim().length === 0) {
+                resolve(null);
+                return;
+              }
 
-        if (cleanContent.length >= 10) {
-          // Parse date more robustly
-          let parsedDate;
-          try {
-            parsedDate = new Date(dateStr).toISOString();
-          } catch {
-            parsedDate = new Date().toISOString();
-          }
+              // Extract URLs before cleaning HTML
+              const urlRegex = /(https?:\/\/[^\s<>"]+)/g;
+              const urls = content.match(urlRegex) || [];
 
-          const note = {
-            id: `note-${i}`,
-            content: cleanContent.substring(0, 500),
-            created_at: parsedDate,
-            source: 'apple-notes',
-            folder: 'Notes'
-          };
+              // Clean HTML but preserve structure
+              const cleanContent = content
+                .substring(0, 10000)
+                .replace(/<br>/g, '\n')
+                .replace(/<[^>]*>/g, ' ')
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"')
+                .replace(/\s+/g, ' ')
+                .replace(/\n\s+/g, '\n')
+                .trim();
 
-          // Add metadata if present
-          if (urls.length > 0) {
-            note.urls = urls.slice(0, 5); // Max 5 URLs
-          }
+              if (cleanContent.length >= 10) {
+                let parsedDate;
+                try {
+                  parsedDate = new Date(dateStr).toISOString();
+                } catch {
+                  parsedDate = new Date().toISOString();
+                }
 
-          const attachCount = parseInt(attachmentCount);
-          if (!isNaN(attachCount) && attachCount > 0) {
-            note.has_media = true;
-            note.media_count = attachCount;
-          }
+                const note = {
+                  id: `note-${i}`,
+                  content: cleanContent.substring(0, 500),
+                  created_at: parsedDate,
+                  source: 'apple-notes',
+                  folder: 'Notes'
+                };
 
-          notes.push(note);
+                if (urls.length > 0) {
+                  note.urls = urls.slice(0, 5);
+                }
 
-          if (notes.length % 10 === 0) {
-            console.log(`  Processed ${notes.length} notes...`);
-          }
-        }
-      } catch (err) {
-        // Skip notes that fail but log first few errors
-        if (notes.length < 3) {
-          console.error(`  ⚠️  Note ${i} failed:`, err.message.substring(0, 100));
-        }
-        continue;
+                const attachCount = parseInt(attachmentCount);
+                if (!isNaN(attachCount) && attachCount > 0) {
+                  note.has_media = true;
+                  note.media_count = attachCount;
+                }
+
+                resolve(note);
+              } else {
+                resolve(null);
+              }
+            } catch (err) {
+              resolve(null); // Silently skip failed notes
+            }
+          })
+        );
       }
+
+      // Wait for batch to complete
+      const batchResults = await Promise.all(batchPromises);
+      const validNotes = batchResults.filter(n => n !== null);
+      notes.push(...validNotes);
+
+      console.log(`    ✓ Got ${validNotes.length}/${batchSize} notes from this batch`);
     }
 
     console.log(`\n✅ Fetched ${notes.length} notes from Apple Notes\n`);
