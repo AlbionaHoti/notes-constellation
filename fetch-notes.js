@@ -24,10 +24,10 @@ async function fetchNotes() {
     const countResult = execSync(`osascript -e '${countScript}'`, { encoding: 'utf-8' });
     const totalNotes = parseInt(countResult.trim());
 
-    console.log(`📊 Found ${totalNotes} total notes, fetching up to 50...\n`);
+    console.log(`📊 Found ${totalNotes} total notes, fetching all...\n`);
 
     const notes = [];
-    const limit = Math.min(totalNotes, 50);
+    const limit = totalNotes; // Get ALL notes
 
     for (let i = 1; i <= limit; i++) {
       try {
