@@ -6,16 +6,88 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// Load .env file if it exists
+const envPath = join(__dirname, '.env');
+if (existsSync(envPath)) {
+  const envContent = readFileSync(envPath, 'utf-8');
+  envContent.split('\n').forEach(line => {
+    const [key, ...valueParts] = line.split('=');
+    if (key && valueParts.length) {
+      process.env[key.trim()] = valueParts.join('=').trim();
+    }
+  });
+}
+
 const client = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
+
+// Extract JSON from Claude's response (handles markdown code blocks)
+function extractJSON(text) {
+  // Try to find JSON within markdown code blocks
+  let cleaned = text.trim();
+
+  // Remove opening code fence
+  cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, '');
+
+  // Remove closing code fence
+  cleaned = cleaned.replace(/\n?```\s*$/, '');
+
+  return cleaned.trim();
+}
+
+// CRITICAL: Clean and redact sensitive information from notes
+function cleanAndSecureText(text) {
+  if (!text) return '';
+
+  // Remove invalid Unicode surrogate pairs
+  let cleaned = text.replace(/[\uD800-\uDFFF]/g, '');
+
+  // Redact API keys (various formats)
+  cleaned = cleaned.replace(/sk-[a-zA-Z0-9]{20,}/g, '[REDACTED_API_KEY]');
+  cleaned = cleaned.replace(/ANTHROPIC_API_KEY\s*[=:]\s*[^\s]+/gi, 'ANTHROPIC_API_KEY=[REDACTED]');
+  cleaned = cleaned.replace(/OPENAI_API_KEY\s*[=:]\s*[^\s]+/gi, 'OPENAI_API_KEY=[REDACTED]');
+  cleaned = cleaned.replace(/API_KEY\s*[=:]\s*[^\s]+/gi, 'API_KEY=[REDACTED]');
+  cleaned = cleaned.replace(/apikey\s*[=:]\s*[^\s]+/gi, 'apikey=[REDACTED]');
+
+  // Redact passwords
+  cleaned = cleaned.replace(/password\s*[=:]\s*[^\s]+/gi, 'password=[REDACTED]');
+  cleaned = cleaned.replace(/passwd\s*[=:]\s*[^\s]+/gi, 'passwd=[REDACTED]');
+  cleaned = cleaned.replace(/pwd\s*[=:]\s*[^\s]+/gi, 'pwd=[REDACTED]');
+
+  // Redact tokens
+  cleaned = cleaned.replace(/token\s*[=:]\s*[^\s]+/gi, 'token=[REDACTED]');
+  cleaned = cleaned.replace(/access_token\s*[=:]\s*[^\s]+/gi, 'access_token=[REDACTED]');
+  cleaned = cleaned.replace(/bearer\s+[a-zA-Z0-9_\-\.]+/gi, 'bearer [REDACTED]');
+
+  // Redact secrets
+  cleaned = cleaned.replace(/secret\s*[=:]\s*[^\s]+/gi, 'secret=[REDACTED]');
+  cleaned = cleaned.replace(/client_secret\s*[=:]\s*[^\s]+/gi, 'client_secret=[REDACTED]');
+
+  // Redact credit cards (basic pattern)
+  cleaned = cleaned.replace(/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, '[REDACTED_CC]');
+
+  // Redact SSH keys
+  cleaned = cleaned.replace(/-----BEGIN (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----[\s\S]*?-----END (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----/g, '[REDACTED_SSH_KEY]');
+
+  // Redact database connection strings
+  cleaned = cleaned.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/gi, '[REDACTED_DB_CONNECTION]');
+
+  // Redact AWS keys
+  cleaned = cleaned.replace(/AKIA[0-9A-Z]{16}/g, '[REDACTED_AWS_KEY]');
+
+  // Redact JWT tokens
+  cleaned = cleaned.replace(/eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g, '[REDACTED_JWT]');
+
+  return cleaned;
+}
 
 async function analyzeConnections() {
   console.log('🔍 Analyzing connections between notes...\n');
@@ -56,50 +128,124 @@ async function analyzeConnections() {
 }
 
 async function extractThemes(notes) {
-  const prompt = `You are a theme extraction agent. Analyze these notes and identify key themes, emotions, and concepts.
+  // Process in batches to avoid context limits
+  const batchSize = 100;
+  const allThemes = [];
 
-Notes:
-${notes.map((n, i) => `${i + 1}. ${n.content}`).join('\n')}
+  for (let i = 0; i < notes.length; i += batchSize) {
+    const batch = notes.slice(i, i + batchSize);
+    console.log(`   Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(notes.length / batchSize)} (${batch.length} notes)...`);
 
-For each note, extract:
-- Main themes (2-3 keywords)
-- Emotional tone
-- Core concept
+    const prompt = `You are a theme extraction agent. Analyze these notes and classify them into these specific clusters:
 
-Return JSON array matching the note order with: { themes: [], emotion: "", concept: "" }`;
+**CLUSTERS:**
+1. AI Systems - AI tools, automation, Claude, machine learning
+2. Social Products - Social apps, community, connections, relationships
+3. Privacy & Tech - Security, privacy, data protection, encryption
+4. Creative Philosophy - Creativity, art, thinking, reflection
+5. Tools & Workflows - Productivity, systems, processes, organization
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-5-20250929',
-    max_tokens: 2000,
-    messages: [{ role: 'user', content: prompt }]
-  });
+**Notes:**
+${batch.map((n, idx) => `${idx + 1}. ${cleanAndSecureText(n.content).substring(0, 200)}`).join('\n\n')}
 
-  const themesData = JSON.parse(response.content[0].text);
+For each note, assign it to the BEST matching cluster and extract themes.
+Return ONLY a JSON array with ${batch.length} objects: [{ cluster: "AI Systems", themes: ["AI", "tools"], concept: "brief concept" }]`;
+
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-5-20250929', // Faster model for large-scale processing
+      max_tokens: 16000,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const extracted = extractJSON(response.content[0].text);
+    const batchThemes = JSON.parse(extracted);
+    allThemes.push(...batchThemes);
+  }
+
+  // Map clusters to colors
+  const clusterColors = {
+    "AI Systems": "#fbbf24",
+    "Social Products": "#ec4899",
+    "Privacy & Tech": "#22d3ee",
+    "Creative Philosophy": "#a78bfa",
+    "Tools & Workflows": "#06b6d4"
+  };
 
   return notes.map((note, i) => ({
     ...note,
-    ...themesData[i]
+    cluster: allThemes[i].cluster,
+    color: clusterColors[allThemes[i].cluster] || "#fbbf24",
+    ...allThemes[i]
   }));
 }
 
 async function findConnections(notes) {
-  const prompt = `You are a connection discovery agent. Find hidden connections between these notes.
+  // For large note sets, use algorithmic connection finding based on themes
+  console.log('   Finding connections based on shared themes and clusters...');
 
-Notes:
-${notes.map((n, i) => `${i + 1}. ${n.content}\n   Themes: ${n.themes.join(', ')}\n   Concept: ${n.concept}`).join('\n\n')}
+  const connections = [];
 
-Find thematic, conceptual, and emotional connections. Return JSON array:
-[{ from: 0, to: 1, reason: "why connected", strength: 0-1 }]
+  // Calculate theme similarity between notes
+  function calculateSimilarity(note1, note2) {
+    const themes1 = new Set(note1.themes);
+    const themes2 = new Set(note2.themes);
+    const intersection = [...themes1].filter(t => themes2.has(t)).length;
+    const union = new Set([...themes1, ...themes2]).size;
+    return union > 0 ? intersection / union : 0;
+  }
 
-Only include meaningful connections (strength > 0.3).`;
-
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-5-20250929',
-    max_tokens: 2000,
-    messages: [{ role: 'user', content: prompt }]
+  // Find connections within same cluster (strong connections)
+  const clusterGroups = {};
+  notes.forEach((note, i) => {
+    if (!clusterGroups[note.cluster]) clusterGroups[note.cluster] = [];
+    clusterGroups[note.cluster].push(i);
   });
 
-  return JSON.parse(response.content[0].text);
+  Object.values(clusterGroups).forEach(indices => {
+    // Connect each note to its 3 most similar cluster-mates
+    indices.forEach(i => {
+      const similarities = indices
+        .filter(j => j !== i)
+        .map(j => ({
+          to: j,
+          similarity: calculateSimilarity(notes[i], notes[j]),
+          reason: `Both explore ${notes[i].themes.slice(0, 2).join(' and ')}`
+        }))
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, 3);
+
+      similarities.forEach(({ to, similarity, reason }) => {
+        if (similarity > 0.3) {
+          connections.push({
+            from: i,
+            to,
+            reason,
+            strength: similarity
+          });
+        }
+      });
+    });
+  });
+
+  // Find cross-cluster connections (bridges)
+  for (let i = 0; i < notes.length; i++) {
+    for (let j = i + 1; j < notes.length; j++) {
+      if (notes[i].cluster !== notes[j].cluster) {
+        const similarity = calculateSimilarity(notes[i], notes[j]);
+        if (similarity > 0.5) { // Higher threshold for cross-cluster
+          connections.push({
+            from: i,
+            to: j,
+            reason: `Bridge between ${notes[i].cluster} and ${notes[j].cluster}`,
+            strength: similarity
+          });
+        }
+      }
+    }
+  }
+
+  console.log(`   Found ${connections.length} connections`);
+  return connections;
 }
 
 async function mapCoordinates(notes, connections) {
@@ -108,7 +254,7 @@ async function mapCoordinates(notes, connections) {
 
   const stars = notes.map((note, i) => ({
     id: i,
-    content: note.content,
+    content: cleanAndSecureText(note.content),
     themes: note.themes,
     source: note.source,
     position: {
