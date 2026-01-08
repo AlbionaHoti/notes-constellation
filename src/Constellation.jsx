@@ -3,9 +3,13 @@ import { OrbitControls, Stars as BackgroundStars, Line } from '@react-three/drei
 import { useState, useRef, useMemo } from 'react'
 import * as THREE from 'three'
 
-function Star({ position, color, content, themes, onClick, isHovered, onHover }) {
+function Star({ position, color, content, themes, onClick, isHovered, onHover, temporalDepth, created_at }) {
   const meshRef = useRef()
   const glowRef = useRef()
+
+  // Calculate size based on temporal depth: closer (recent) = bigger, farther (old) = smaller
+  const baseSize = 0.15 - (temporalDepth * 0.12) // Range: 0.15 (new) to 0.03 (old)
+  const opacity = 0.95 - (temporalDepth * 0.6) // Range: 0.95 (new) to 0.35 (old)
 
   useFrame((state) => {
     if (meshRef.current && isHovered) {
@@ -33,11 +37,13 @@ function Star({ position, color, content, themes, onClick, isHovered, onHover })
           onHover(false)
         }}
       >
-        <sphereGeometry args={[0.1, 16, 16]} />
+        <sphereGeometry args={[baseSize, 16, 16]} />
         <meshStandardMaterial
           color={color}
           emissive={color}
-          emissiveIntensity={isHovered ? 2.5 : 1.2}
+          emissiveIntensity={isHovered ? 3 : (1.5 - temporalDepth * 0.8)}
+          opacity={opacity}
+          transparent
           toneMapped={false}
         />
       </mesh>
@@ -133,30 +139,7 @@ function Constellation({ data }) {
           speed={1}
         />
 
-        {/* Connections (render first so stars appear on top) */}
-        {data.connections.map((conn, i) => (
-          <AnimatedConnection
-            key={i}
-            from={[
-              data.stars[conn.from].position.x,
-              data.stars[conn.from].position.y,
-              data.stars[conn.from].position.z
-            ]}
-            to={[
-              data.stars[conn.to].position.x,
-              data.stars[conn.to].position.y,
-              data.stars[conn.to].position.z
-            ]}
-            fromColor={data.stars[conn.from].color}
-            toColor={data.stars[conn.to].color}
-            strength={conn.strength}
-            reason={conn.reason}
-            isHovered={hoveredConnection === i}
-            onHover={(isHovered) => {
-              setHoveredConnection(isHovered ? i : null)
-            }}
-          />
-        ))}
+        {/* Connections removed - cleaner view focused on stars */}
 
         {/* Constellation stars */}
         {data.stars.map((star) => (
@@ -166,6 +149,8 @@ function Constellation({ data }) {
             color={star.color}
             content={star.content}
             themes={star.themes}
+            temporalDepth={star.temporalDepth || 0}
+            created_at={star.created_at}
             onClick={() => handleStarClick(star)}
             isHovered={hoveredStar === star.id}
             onHover={(isHovered) => {
