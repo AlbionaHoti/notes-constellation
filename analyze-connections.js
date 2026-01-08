@@ -128,9 +128,23 @@ async function analyzeConnections() {
 }
 
 async function extractThemes(notes) {
-  // Process in batches to avoid context limits
-  const batchSize = 100;
+  // Process in smaller batches with retry logic
+  const batchSize = 50; // Reduced for stability
   const allThemes = [];
+
+  // Helper: retry with exponential backoff
+  async function retryWithBackoff(fn, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        if (attempt === maxRetries) throw error;
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+        console.log(`   ⚠️  Retry ${attempt}/${maxRetries} after ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
 
   for (let i = 0; i < notes.length; i += batchSize) {
     const batch = notes.slice(i, i + batchSize);
@@ -151,15 +165,21 @@ ${batch.map((n, idx) => `${idx + 1}. ${cleanAndSecureText(n.content).substring(0
 For each note, assign it to the BEST matching cluster and extract themes.
 Return ONLY a JSON array with ${batch.length} objects: [{ cluster: "AI Systems", themes: ["AI", "tools"], concept: "brief concept" }]`;
 
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-5-20250929', // Faster model for large-scale processing
-      max_tokens: 16000,
-      messages: [{ role: 'user', content: prompt }]
+    const batchThemes = await retryWithBackoff(async () => {
+      const response = await client.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 16000,
+        messages: [{ role: 'user', content: prompt }]
+      });
+
+      const extracted = extractJSON(response.content[0].text);
+      return JSON.parse(extracted);
     });
 
-    const extracted = extractJSON(response.content[0].text);
-    const batchThemes = JSON.parse(extracted);
     allThemes.push(...batchThemes);
+
+    // Small delay between batches to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
 
   // Map clusters to colors
@@ -249,42 +269,69 @@ async function findConnections(notes) {
 }
 
 async function mapCoordinates(notes, connections) {
-  // Simple force-directed layout simulation
-  // Stars closer to connected stars
+  // Temporal positioning: Recent notes close, old notes far into the universe
 
-  const stars = notes.map((note, i) => ({
-    id: i,
-    content: cleanAndSecureText(note.content),
-    themes: note.themes,
-    source: note.source,
-    position: {
-      x: (Math.random() - 0.5) * 10,
-      y: (Math.random() - 0.5) * 10,
-      z: (Math.random() - 0.5) * 10
-    },
-    color: note.source === 'apple-notes' ? '#fbbf24' : '#22d3ee'
-  }));
+  // Find oldest and newest notes
+  const dates = notes.map(n => new Date(n.created_at).getTime());
+  const oldestDate = Math.min(...dates);
+  const newestDate = Math.max(...dates);
+  const dateRange = newestDate - oldestDate;
 
-  // Simple spring simulation for layout
-  for (let iter = 0; iter < 50; iter++) {
+  const stars = notes.map((note, i) => {
+    // Calculate temporal depth (0 = newest/close, 1 = oldest/far)
+    const noteDate = new Date(note.created_at).getTime();
+    const temporalDepth = dateRange > 0 ? (newestDate - noteDate) / dateRange : 0;
+
+    // Z-axis represents time: negative = far away (old), positive = close (new)
+    // Range: -50 (very old) to 5 (very new)
+    const z = 5 - (temporalDepth * 55);
+
+    // X and Y based on cluster, with some randomness
+    const clusterOffset = {
+      "AI Systems": { x: -15, y: 10 },
+      "Social Products": { x: 15, y: 10 },
+      "Privacy & Tech": { x: -15, y: -10 },
+      "Creative Philosophy": { x: 15, y: -10 },
+      "Tools & Workflows": { x: 0, y: 0 }
+    };
+
+    const offset = clusterOffset[note.cluster] || { x: 0, y: 0 };
+
+    return {
+      id: i,
+      content: cleanAndSecureText(note.content),
+      themes: note.themes,
+      source: note.source,
+      created_at: note.created_at,
+      cluster: note.cluster,
+      position: {
+        x: offset.x + (Math.random() - 0.5) * 8,
+        y: offset.y + (Math.random() - 0.5) * 8,
+        z: z
+      },
+      color: note.color,
+      temporalDepth: temporalDepth
+    };
+  });
+
+  // Spring simulation only affects X and Y (preserve Z temporal depth)
+  for (let iter = 0; iter < 30; iter++) {
     connections.forEach(conn => {
       const star1 = stars[conn.from];
       const star2 = stars[conn.to];
 
       const dx = star2.position.x - star1.position.x;
       const dy = star2.position.y - star1.position.y;
-      const dz = star2.position.z - star1.position.z;
 
-      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      const force = (distance - 2) * 0.1 * conn.strength;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const force = (distance - 3) * 0.05 * conn.strength;
 
+      // Only adjust X and Y, keep Z (temporal depth) fixed
       star1.position.x += dx * force * 0.01;
       star1.position.y += dy * force * 0.01;
-      star1.position.z += dz * force * 0.01;
 
       star2.position.x -= dx * force * 0.01;
       star2.position.y -= dy * force * 0.01;
-      star2.position.z -= dz * force * 0.01;
     });
   }
 
